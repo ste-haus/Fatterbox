@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from chatterbox.tts import Conditionals
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -90,10 +91,9 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
         
         _LOGGER.info(f"TTS request: '{text[:50]}...' with voice: {request.voice}")
         
-        # Get audio prompt path
-        audio_prompt_path = voices.get(request.voice) if request.voice else None
-        
-        if request.voice and not audio_prompt_path:
+        voice_path = voices.get(request.voice) if request.voice else None
+
+        if request.voice and not voice_path:
             raise HTTPException(status_code=404, detail=f"Voice '{request.voice}' not found")
         
         async def generate_chunks():
@@ -121,7 +121,7 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
                         _generate_audio_sync,
                         model,
                         chunk,
-                        audio_prompt_path
+                        voice_path
                     )
                     
                     chunk_time = time.time() - chunk_start
@@ -160,50 +160,52 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
     return app
 
 
-def _generate_audio_sync(model, text: str, audio_prompt_path: str = None) -> torch.Tensor:
+def _generate_audio_sync(model, text: str, voice_path: str = None) -> torch.Tensor:
     """Generate audio synchronously (same logic as Wyoming handler)."""
     with torch.no_grad():
-        # Get backend and generation params from model
         backend = getattr(model, '_wyoming_backend', 'cudagraphs-manual')
         gen_params = getattr(model, '_wyoming_gen_params', {})
-        
-        # Performance parameters only
+
         t3_params = {
             "benchmark_t3": True,
             "generate_token_backend": backend,
             "skip_when_1": True,
         }
-        
-        # Add seed if specified
+
         if gen_params.get("seed"):
             t3_params["seed"] = gen_params["seed"]
-        
-        # Generate with or without voice cloning
-        if audio_prompt_path:
+
+        if voice_path and voice_path.endswith(".pt"):
+            device = next(model.t3.parameters()).device
+            model.conds = Conditionals.load(voice_path, map_location=device)
+            _LOGGER.debug("Using conditioned voice (exaggeration baked into .pt)")
             wav = model.generate(
                 text,
-                audio_prompt_path=audio_prompt_path,
+                cfg_weight=gen_params.get("cfg_weight", 0.5),
+                t3_params=t3_params,
+            )
+        elif voice_path:
+            wav = model.generate(
+                text,
+                audio_prompt_path=voice_path,
                 exaggeration=gen_params.get("exaggeration", 0.5),
                 cfg_weight=gen_params.get("cfg_weight", 0.5),
                 t3_params=t3_params,
             )
         else:
-            # Use default voice if no prompt provided
             wav = model.generate(
                 text,
                 exaggeration=gen_params.get("exaggeration", 0.5),
                 cfg_weight=gen_params.get("cfg_weight", 0.5),
                 t3_params=t3_params,
             )
-        
-        # Move to CPU
+
         result = wav.squeeze().cpu()
-    
-    # Synchronize and cleanup
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-    
+
     return result
 
 

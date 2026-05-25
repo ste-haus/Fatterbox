@@ -6,11 +6,27 @@ Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://gi
 
 - Docker with NVIDIA GPU support ([install nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
 - NVIDIA GPU with CUDA capability
-- Voice reference files (.wav format)
+- Voice files: `.wav` (reference audio) and/or `.pt` (pre-conditioned)
 
 ## Quick Start
 
-1. **Prepare voice files**: Place `.wav` files in a `voices` directory. Each file becomes a voice (e.g., `Jake.wav` → voice name "Jake").
+1. **Prepare voice files**: Place voice files in a `voices` directory. Each file becomes a voice named after the file stem (e.g., `Jake.wav` or `Jake.pt` → voice name "Jake").
+
+   - **`.wav`** — Reference audio. Speaker conditioning is extracted from the audio on each generation call.
+   - **`.pt`** — Pre-conditioned voice (a serialized Chatterbox `Conditionals` object). Faster at generation time since conditioning is pre-computed. If both `Jake.wav` and `Jake.pt` exist, the `.pt` takes precedence.
+
+   To create a `.pt` from a `.wav`, use the included `scripts/condition_voice.py` script (dependencies are declared inline — `uv` handles the rest):
+   ```bash
+   # Generate conditioned voice (outputs voices/Jake.pt)
+   uv run --no-project scripts/condition_voice.py voices/Jake.wav
+
+   # With custom exaggeration (default: 0.5)
+   uv run --no-project scripts/condition_voice.py voices/Jake.wav -e 0.8
+
+   # Custom output path
+   uv run --no-project scripts/condition_voice.py voices/Jake.wav -o voices/alt-Jake.pt
+   ```
+   > **Note:** The `exaggeration` value is baked into the `.pt` file at creation time. The runtime `FATTERBOX_EXAGGERATION` setting has no effect on `.pt` voices.
 
 2. **Pull the prebuilt image** (or build your own with `docker build -t fatterbox .`):
 ```bash
