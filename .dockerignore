@@ -1,0 +1,12 @@
+.git
+.github
+.claude
+.venv
+outputs
+voices
+scripts
+design
+__pycache__
+*.pyc
+*.egg-info
+.DS_Store

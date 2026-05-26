@@ -59,16 +59,10 @@ def main():
         model = ChatterboxTTS.from_pretrained(device=device)
         _LOGGER.info("✓ Model loaded successfully")
         
-        # Do a test generation to ensure everything is cached
-        _LOGGER.info("Performing test generation to verify model...")
-        with torch.no_grad():
-            test_audio = model.generate(
-                "Testing model initialization.", 
-                t3_params={"generate_token_backend": "eager"}  # Use eager for compatibility
-            )
-        _LOGGER.info("✓ Test generation successful")
-        
-        # Clean up
+        # Skip test generation during build — running inference under QEMU
+        # emulation doubles memory footprint and can exhaust disk via swap.
+        # from_pretrained() already downloads and caches all model files.
+
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
