@@ -1,6 +1,6 @@
 [project]
 name = "fatterbox"
-version = "1.0.0"
+version = "1.1.0"
 description = "fatterbox"
 requires-python = "==3.11.*"
 dependencies = [

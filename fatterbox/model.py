@@ -1,5 +1,6 @@
 """Model loading and initialization for Chatterbox TTS."""
 import logging
+import threading
 from functools import lru_cache
 
 import torch
@@ -89,3 +90,10 @@ def _warmup_model(model):
         t3_params={"generate_token_backend": "cudagraphs-manual"}
     )
     _LOGGER.info("Warmup complete - cudagraphs ready")
+
+
+# Serialises every mutation of model.conds. Both conditioning and generation
+# assign it, and on-demand conditioning runs while requests are in flight.
+# Reentrant because the Wyoming handler re-enters generation to fall back to a
+# default voice while already holding the lock.
+MODEL_LOCK = threading.RLock()

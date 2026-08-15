@@ -4,12 +4,14 @@ import logging
 import time
 
 import torch
+from chatterbox.tts import Conditionals
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
-from wyoming.info import Describe, Info
+from wyoming.info import Describe
 from wyoming.server import AsyncEventHandler
 from wyoming.tts import (Synthesize, SynthesizeChunk, SynthesizeStart,
                          SynthesizeStop, SynthesizeStopped)
 
+from .model import MODEL_LOCK
 from .utils import Colors, split_text
 
 _LOGGER = logging.getLogger(__name__)
@@ -18,10 +20,9 @@ _LOGGER = logging.getLogger(__name__)
 class ChatterboxEventHandler(AsyncEventHandler):
     """Wyoming event handler for Chatterbox TTS."""
     
-    def __init__(self, wyoming_info: Info, model, voices: dict, *args, **kwargs):
+    def __init__(self, wyoming_info_factory, model, voices, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.wyoming_info = wyoming_info
-        self.wyoming_info_event = wyoming_info.event()
+        self.wyoming_info_factory = wyoming_info_factory
         self.model = model
         self.voices = voices
         self.sample_rate = model.sr  # Use model's native sample rate
@@ -36,7 +37,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
         """Handle Wyoming protocol events."""
         # Send info on Describe event
         if Describe.is_type(event.type):
-            await self.write_event(self.wyoming_info_event)
+            # Rebuilt per Describe so a reload is reflected without reconnecting
+            await self.write_event(self.wyoming_info_factory().event())
             return True
 
         # Handle streaming TTS (new protocol)
@@ -89,10 +91,10 @@ class ChatterboxEventHandler(AsyncEventHandler):
 
         _LOGGER.info(f"[Client {self.client_id}] Synthesizing: '{text[:50]}...' with voice: {voice_name}")
 
-        # Get the audio prompt path for voice cloning
-        audio_prompt_path = self.voices.get(voice_name) if voice_name else None
+        voice = self.voices.get(voice_name) if voice_name else None
+        voice_path = voice.path if voice else None
 
-        if voice_name and not audio_prompt_path:
+        if voice_name and not voice:
             _LOGGER.warning(f"Voice '{voice_name}' not found, using default")
 
         # Split on sentence boundaries for streaming
@@ -132,7 +134,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     None, 
                     self._generate_audio, 
                     chunk, 
-                    audio_prompt_path
+                    voice_path
                 )
 
                 chunk_synth_time = time.time() - chunk_start
@@ -194,50 +196,45 @@ class ChatterboxEventHandler(AsyncEventHandler):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
-    def _generate_audio(self, text: str, audio_prompt_path: str = None) -> torch.Tensor:
+    def _generate_audio(self, text: str, voice_path: str = None) -> torch.Tensor:
         """Generate audio using Chatterbox (synchronous)."""
-        # Use no_grad to prevent memory accumulation from autograd
-        with torch.no_grad():
-            # Get backend and generation params from model (set during initialization)
+        with MODEL_LOCK, torch.no_grad():
             backend = getattr(self.model, '_wyoming_backend', 'cudagraphs-manual')
             gen_params = getattr(self.model, '_wyoming_gen_params', {})
 
-            # Only include backend/performance parameters in t3_params
-            # Sampling parameters (temperature, top_p, etc.) may cause conflicts
             t3_params = {
                 "benchmark_t3": True,
                 "generate_token_backend": backend,
-                "skip_when_1": True,  # Skip Top P when it's 1.0
+                "skip_when_1": True,
             }
 
-            # Add seed if specified (non-zero)
             if gen_params.get("seed"):
                 t3_params["seed"] = gen_params["seed"]
 
-            # Generate with or without voice cloning
-            # Note: Removed temperature, top_p, min_p, max_new_tokens from t3_params
-            # as they may be causing conflicts or aren't supported in the public API
-            if audio_prompt_path:
+            if voice_path and voice_path.endswith(".pt"):
+                device = next(self.model.t3.parameters()).device
+                self.model.conds = Conditionals.load(voice_path, map_location=device)
+                _LOGGER.debug("Using conditioned voice")
                 wav = self.model.generate(
-                    text, 
-                    audio_prompt_path=audio_prompt_path,
+                    text,
+                    exaggeration=gen_params.get("exaggeration", 0.5),
+                    cfg_weight=gen_params.get("cfg_weight", 0.5),
+                    t3_params=t3_params,
+                )
+            elif voice_path:
+                wav = self.model.generate(
+                    text,
+                    audio_prompt_path=voice_path,
                     exaggeration=gen_params.get("exaggeration", 0.5),
                     cfg_weight=gen_params.get("cfg_weight", 0.5),
                     t3_params=t3_params,
                 )
             else:
-                # Use default voice if no prompt provided
                 default_voice = next(iter(self.voices.values()), None)
                 if default_voice:
-                    wav = self.model.generate(
-                        text, 
-                        audio_prompt_path=default_voice,
-                        exaggeration=gen_params.get("exaggeration", 0.5),
-                        cfg_weight=gen_params.get("cfg_weight", 0.5),
-                        t3_params=t3_params,
-                    )
+                    wav = self._generate_audio(text, default_voice.path)
+                    return wav
                 else:
-                    # Fallback: generate without voice cloning
                     wav = self.model.generate(
                         text,
                         exaggeration=gen_params.get("exaggeration", 0.5),
@@ -245,10 +242,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         t3_params=t3_params,
                     )
 
-            # Move to CPU immediately to free VRAM - numpy conversion happens on CPU anyway
             result = wav.squeeze().cpu()
 
-        # Synchronize to ensure all CUDA operations are complete before cleanup
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()

@@ -15,13 +15,12 @@ from wyoming.server import AsyncServer
 from .openapi import create_api
 from .handler import ChatterboxEventHandler
 from .model import load_model
-from .voices import load_voices, create_wyoming_info
+from .voices import VoiceRegistry, precondition_voices, load_voices, create_wyoming_info
 from .utils import get_env_str, get_env_float, get_env_int, get_env_bool
 
 _LOGGER = logging.getLogger(__name__)
 
-
-async def run_wyoming_server(args, model, voices, wyoming_info):
+async def run_wyoming_server(args, model, voices, wyoming_info_factory):
     """Run Wyoming protocol server."""
     _LOGGER.info(f"Starting Wyoming server on tcp://{args.wyoming_host}:{args.wyoming_port}")
     uri = f"tcp://{args.wyoming_host}:{args.wyoming_port}"
@@ -30,7 +29,7 @@ async def run_wyoming_server(args, model, voices, wyoming_info):
     await server.run(
         partial(
             ChatterboxEventHandler,
-            wyoming_info,
+            wyoming_info_factory,
             model,
             voices
         )
@@ -39,7 +38,7 @@ async def run_wyoming_server(args, model, voices, wyoming_info):
 
 async def run_fastapi_server(args, model, voices):
     """Run FastAPI REST API server."""
-    app = create_api(model, voices, args.voices_dir)
+    app = create_api(model, voices, args.voices_dir, args.precondition_on_start)
     
     host = args.openapi_host
     port = args.openapi_port
@@ -128,6 +127,12 @@ async def main():
                        default=get_env_float("FATTERBOX_FLOW_CFG_SCALE", 1.0),
                        help="CFG scale for mel decoder (default: 1.0, env: FATTERBOX_FLOW_CFG_SCALE)")
     
+    parser.add_argument("--precondition-on-start",
+                       dest="precondition_on_start",
+                       action="store_true",
+                       default=get_env_bool("FATTERBOX_PRECONDITION_ON_START", False),
+                       help="At startup, transcode .mp3 sources to .wav and generate missing or outdated .pt files (default: false, env: FATTERBOX_PRECONDITION_ON_START)")
+
     parser.add_argument("--debug", 
                        action="store_true",
                        default=get_env_bool("FATTERBOX_DEBUG", False),
@@ -171,16 +176,22 @@ async def main():
     # Create voices directory if it doesn't exist
     args.voices_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load voices
-    voices = load_voices(args.voices_dir)
-    
-    # Create Wyoming info (using model's native sample rate)
-    wyoming_info = create_wyoming_info(args.voices_dir, model.sr)
+    # Backfill derived voice files before discovery, so anything written here is picked up
+    if args.precondition_on_start:
+        precondition_voices(args.voices_dir, model, args.exaggeration)
+    else:
+        _LOGGER.info("Startup preconditioning disabled (set FATTERBOX_PRECONDITION_ON_START=true to enable)")
+
+    # Load voices into a registry so a reload can swap the whole snapshot
+    voices = VoiceRegistry(load_voices(args.voices_dir))
+
+    # Rebuilt per Describe rather than baked once, so reloads are visible
+    wyoming_info_factory = lambda: create_wyoming_info(voices)
     
     # Run both servers concurrently
     _LOGGER.info("="*60)
     await asyncio.gather(
-        run_wyoming_server(args, model, voices, wyoming_info),
+        run_wyoming_server(args, model, voices, wyoming_info_factory),
         run_fastapi_server(args, model, voices)
     )
 
