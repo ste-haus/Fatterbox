@@ -14,7 +14,16 @@ Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://gi
 
    - **`.mp3`** — Source audio. Not usable directly; must be transcoded to `.wav` first (see preconditioning below).
    - **`.wav`** — Reference audio. Speaker conditioning is extracted from the audio on each generation call.
-   - **`.pt`** — Pre-conditioned voice (a serialized Chatterbox `Conditionals` object). Faster at generation time since conditioning is pre-computed. If both `Jake.wav` and `Jake.pt` exist, the `.pt` takes precedence.
+   - **`.pt`** — Pre-conditioned voice (a serialized Chatterbox `Conditionals` object). Faster at generation time since conditioning is pre-computed. If both `Jake.wav` and `Jake.pt` exist, the `.pt` takes precedence and the `.wav` is kept so the `.pt` can be regenerated from it.
+
+   ```
+   voices/
+     Jake.wav          reference audio
+     Jake.pt           conditioned — used for generation
+     archived/         superseded files, ignored by discovery
+   ```
+
+   One `.pt` per voice serves every exaggeration. Conditioning derives the speaker embedding and prompt tokens from the audio — none of which depend on exaggeration — and stores exaggeration separately as a single `emotion_adv` scalar that Chatterbox swaps per request. The value a `.pt` was conditioned at is therefore informational; it is logged at startup and reported by `/v1/voices`, but does not constrain what you can request.
 
 ### Preconditioning
 
@@ -22,9 +31,11 @@ Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://gi
 
    - Every `.mp3` without a current `.wav` is transcoded with `ffmpeg` to mono 16-bit PCM at the model's native sample rate (24 kHz), which is the rate Chatterbox reads reference audio at — so nothing is resampled twice and no detail is discarded.
    - Every `.wav` without a matching `.pt` is conditioned in place.
-   - A derived file older than its source is regenerated. The superseded file is renamed to `Jake.pt.YYYYMMDD` (or `Jake.wav.YYYYMMDD`), stamped with the date it was originally generated, and is ignored by voice discovery from then on. Touching a `.mp3` therefore cascades through both stages.
+   - A derived file older than its source is regenerated and the superseded file moved to `voices/archived/`, stamped with the date it was generated. Touching a `.mp3` therefore cascades through both stages.
 
-   Conditioning reuses the already-loaded model, so it costs no extra VRAM — but it does add a few seconds of startup time per new voice. Each stage writes to a `.partial` file and renames on success, so an interrupted or failed run never leaves a truncated `.wav`/`.pt` behind, and a voice always keeps its last working file. Failures are logged and skipped; they never block startup.
+   The same pass runs on `POST /v1/voices/reload` (see [Reload Voices](#reload-voices)), so adding a voice does not require a restart.
+
+   Conditioning reuses the already-loaded model, so it costs no extra VRAM, and is a handful of forward passes over a short clip rather than another model load. Elapsed time is logged per voice. Each stage writes to a `.partial` file and renames on success, so an interrupted or failed run never leaves a truncated `.wav`/`.pt` behind, and a voice always keeps its last working file. Failures are logged and skipped; they never block startup.
 
    > **Note:** `ffmpeg` must be on `PATH` for `.mp3` transcoding. The Docker image already includes it.
 
@@ -39,7 +50,7 @@ Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://gi
    # Custom output path
    uv run --no-project scripts/condition_voice.py voices/Jake.wav -o voices/alt-Jake.pt
    ```
-   > **Note:** The `exaggeration` value is baked into the `.pt` file at creation time. The runtime `FATTERBOX_EXAGGERATION` setting has no effect on `.pt` voices.
+   > **Note:** `-e` sets the `emotion_adv` value stored in the file, but Chatterbox overrides it per request, so it has no effect on output. It exists for parity with the on-disk format.
 
 2. **Pull the prebuilt image** (or build your own with `docker build -t fatterbox .`):
 ```bash
@@ -60,7 +71,7 @@ docker run --gpus all \
 Two servers run simultaneously:
 
 - **Wyoming protocol**: `tcp://0.0.0.0:10200` (Home Assistant integration)
-- **OpenAPI REST**: `http://0.0.0.0:8000` (OpenAI-compatible)
+- **OpenAPI REST**: `http://0.0.0.0:8000` (OpenAI-compatible, plus Fatterbox-only discovery and reload endpoints)
 
 ## Configuration
 
@@ -130,10 +141,64 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output speech.wav
 ```
 
+### Requesting a different exaggeration
+
+`/v1/audio/speech` accepts an optional `exaggeration` to override the server default per request:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Hello, this is a test.",
+    "voice": "Jake",
+    "exaggeration": 0.9
+  }' \
+  --output speech.wav
+```
+
+Any voice can serve any exaggeration, `.pt` or `.wav`. Omit the field and `FATTERBOX_EXAGGERATION` is used.
+
+Wyoming has no per-request exaggeration field, so Wyoming requests always use `FATTERBOX_EXAGGERATION`.
+
+### Reload Voices
+
+Voices are discovered at startup. To pick up files added since — `.wav` or `.mp3` — without restarting:
+
+```bash
+curl -X POST http://localhost:8000/v1/voices/reload
+```
+```json
+{
+  "voices": ["Jake", "Jess"],
+  "added": ["Jess"],
+  "removed": [],
+  "conditioned": 1,
+  "elapsed": 3.4
+}
+```
+
+The reload runs the same `.mp3` → `.wav` → `.pt` pipeline as startup, conditioning new files only when `FATTERBOX_PRECONDITION_ON_START` is enabled; with it off, a dropped-in `.wav` still becomes a usable voice immediately, just without a `.pt`. Conditioning happens in a worker thread, so in-flight streams keep running.
+
+Call this **after** the file finishes copying. Fatterbox does not watch the directory, deliberately: a partially copied `.wav` is indistinguishable from a complete one, and conditioning it would write a corrupt `.pt` that then takes precedence. Your calling the endpoint is the signal that the file is whole.
+
+Both servers pick up the result — Wyoming rebuilds its voice list per `Describe`, so a reload is visible without reconnecting.
+
 ### List Available Voices
 ```bash
 curl http://localhost:8000/v1/voices
 ```
+```json
+{
+  "voices": [
+    {"name": "Jake", "exaggeration": 0.5},
+    {"name": "Solo", "exaggeration": null}
+  ]
+}
+```
+
+`exaggeration` is the value the `.pt` was conditioned at, or `null` for a `.wav`-only voice. It is informational — it does not limit what a request may ask for. `/v1/info` reports the same plus the backing file path.
+
+> **Note:** `/v1/voices`, `/v1/voices/reload`, and `/v1/info` are Fatterbox conveniences, not part of the OpenAI spec, which has no voice-discovery endpoint. The same goes for the `exaggeration` request field and the `text` alias for `input`.
 
 ## Wyoming Protocol
 

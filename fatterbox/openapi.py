@@ -1,6 +1,7 @@
 """FastAPI REST API server for Chatterbox TTS."""
 import asyncio
 import logging
+import math
 import struct
 import time
 from pathlib import Path
@@ -13,7 +14,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
+from .model import MODEL_LOCK
 from .utils import split_text
+from .voices import reload_voices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ class TTSRequest(BaseModel):
     model: Optional[str] = Field("tts-1", description="Model identifier (for compatibility)")
     response_format: Optional[str] = Field("wav", description="Audio format (only wav supported)")
     speed: Optional[float] = Field(1.0, description="Playback speed (not implemented)")
+    exaggeration: Optional[float] = Field(None, description="Emotional expressiveness (0.0-2.0). Defaults to FATTERBOX_EXAGGERATION. Applied per request regardless of what a .pt was conditioned at.")
     
     class Config:
         populate_by_name = True  # Allow both 'input' and 'text' field names
@@ -34,6 +38,8 @@ class VoiceInfo(BaseModel):
     """Voice information model."""
     name: str
     path: str
+    conditioned: bool = False
+    exaggeration: Optional[float] = None
 
 
 class ServerInfo(BaseModel):
@@ -44,7 +50,7 @@ class ServerInfo(BaseModel):
     voices: list[VoiceInfo]
 
 
-def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
+def create_api(model, voices, voices_dir: Path, precondition: bool = False) -> FastAPI:
     """Create FastAPI application with OpenAPI-compatible endpoints."""
     app = FastAPI(
         title="Fatterbox TTS API",
@@ -65,8 +71,13 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
     async def get_info():
         """Get server information and available voices."""
         voice_list = [
-            VoiceInfo(name=name, path=path)
-            for name, path in voices.items()
+            VoiceInfo(
+                name=voice.name,
+                path=voice.path,
+                conditioned=voice.is_conditioned,
+                exaggeration=voice.exaggeration,
+            )
+            for voice in voices.values()
         ]
         return ServerInfo(
             sample_rate=model.sr,
@@ -75,9 +86,39 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
     
     @app.get("/v1/voices")
     async def get_voices():
-        """Get list of available voices."""
-        return {"voices": list(voices.keys())}
+        """Get available voices.
+
+        `exaggeration` reports the value a .pt was conditioned at, which is
+        informational only -- any voice can serve any requested exaggeration.
+        """
+        return {
+            "voices": [
+                {"name": voice.name, "exaggeration": voice.exaggeration}
+                for voice in voices.values()
+            ]
+        }
     
+    @app.post("/v1/voices/reload")
+    async def reload():
+        """Rescan the voices directory, picking up files added since startup.
+
+        Conditioning is blocking work that holds the model lock, so it runs in
+        a worker thread rather than stalling in-flight streams.
+        """
+        exaggeration = getattr(model, "_wyoming_gen_params", {}).get("exaggeration", 0.5)
+
+        _LOGGER.info(f"Reloading voices from {voices_dir}")
+
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            reload_voices,
+            voices_dir,
+            model,
+            voices,
+            exaggeration,
+            precondition,
+        )
+
     @app.post("/v1/audio/speech")
     async def synthesize(request: TTSRequest):
         """
@@ -91,10 +132,15 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
         
         _LOGGER.info(f"TTS request: '{text[:50]}...' with voice: {request.voice}")
         
-        voice_path = voices.get(request.voice) if request.voice else None
+        voice = voices.get(request.voice) if request.voice else None
 
-        if request.voice and not voice_path:
+        if request.voice and not voice:
             raise HTTPException(status_code=404, detail=f"Voice '{request.voice}' not found")
+
+        gen_params = getattr(model, "_wyoming_gen_params", {})
+
+        voice_path = voice.path if voice else None
+        exaggeration = request.exaggeration if request.exaggeration is not None else gen_params.get("exaggeration", 0.5)
         
         async def generate_chunks():
             """Generate audio chunks using sentence splitting (streaming)."""
@@ -121,7 +167,8 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
                         _generate_audio_sync,
                         model,
                         chunk,
-                        voice_path
+                        voice_path,
+                        exaggeration
                     )
                     
                     chunk_time = time.time() - chunk_start
@@ -160,9 +207,9 @@ def create_api(model, voices: dict, voices_dir: Path) -> FastAPI:
     return app
 
 
-def _generate_audio_sync(model, text: str, voice_path: str = None) -> torch.Tensor:
+def _generate_audio_sync(model, text: str, voice_path: str = None, exaggeration: float = None) -> torch.Tensor:
     """Generate audio synchronously (same logic as Wyoming handler)."""
-    with torch.no_grad():
+    with MODEL_LOCK, torch.no_grad():
         backend = getattr(model, '_wyoming_backend', 'cudagraphs-manual')
         gen_params = getattr(model, '_wyoming_gen_params', {})
 
@@ -175,12 +222,16 @@ def _generate_audio_sync(model, text: str, voice_path: str = None) -> torch.Tens
         if gen_params.get("seed"):
             t3_params["seed"] = gen_params["seed"]
 
+        if exaggeration is None:
+            exaggeration = gen_params.get("exaggeration", 0.5)
+
         if voice_path and voice_path.endswith(".pt"):
             device = next(model.t3.parameters()).device
             model.conds = Conditionals.load(voice_path, map_location=device)
-            _LOGGER.debug("Using conditioned voice (exaggeration baked into .pt)")
+            _LOGGER.debug(f"Using conditioned voice at exaggeration {exaggeration}")
             wav = model.generate(
                 text,
+                exaggeration=exaggeration,
                 cfg_weight=gen_params.get("cfg_weight", 0.5),
                 t3_params=t3_params,
             )
@@ -188,14 +239,14 @@ def _generate_audio_sync(model, text: str, voice_path: str = None) -> torch.Tens
             wav = model.generate(
                 text,
                 audio_prompt_path=voice_path,
-                exaggeration=gen_params.get("exaggeration", 0.5),
+                exaggeration=exaggeration,
                 cfg_weight=gen_params.get("cfg_weight", 0.5),
                 t3_params=t3_params,
             )
         else:
             wav = model.generate(
                 text,
-                exaggeration=gen_params.get("exaggeration", 0.5),
+                exaggeration=exaggeration,
                 cfg_weight=gen_params.get("cfg_weight", 0.5),
                 t3_params=t3_params,
             )
