@@ -6,16 +6,29 @@ Fatterbox is built on [rsxdalv's optimized Chatterbox implementation](https://gi
 
 - Docker with NVIDIA GPU support ([install nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
 - NVIDIA GPU with CUDA capability
-- Voice files: `.wav` (reference audio) and/or `.pt` (pre-conditioned)
+- Voice files: `.mp3` (source audio), `.wav` (reference audio), and/or `.pt` (pre-conditioned)
 
 ## Quick Start
 
 1. **Prepare voice files**: Place voice files in a `voices` directory. Each file becomes a voice named after the file stem (e.g., `Jake.wav` or `Jake.pt` → voice name "Jake").
 
+   - **`.mp3`** — Source audio. Not usable directly; must be transcoded to `.wav` first (see preconditioning below).
    - **`.wav`** — Reference audio. Speaker conditioning is extracted from the audio on each generation call.
    - **`.pt`** — Pre-conditioned voice (a serialized Chatterbox `Conditionals` object). Faster at generation time since conditioning is pre-computed. If both `Jake.wav` and `Jake.pt` exist, the `.pt` takes precedence.
 
-   To create a `.pt` from a `.wav`, use the included `scripts/condition_voice.py` script (dependencies are declared inline — `uv` handles the rest):
+### Preconditioning
+
+   Set `FATTERBOX_PRECONDITION_ON_START=true` (or pass `--precondition-on-start`) to bring the voices directory up to date at startup, before either server accepts traffic. **Off by default.** The pipeline is `.mp3` → `.wav` → `.pt`:
+
+   - Every `.mp3` without a current `.wav` is transcoded with `ffmpeg` to mono 16-bit PCM at the model's native sample rate (24 kHz), which is the rate Chatterbox reads reference audio at — so nothing is resampled twice and no detail is discarded.
+   - Every `.wav` without a matching `.pt` is conditioned in place.
+   - A derived file older than its source is regenerated. The superseded file is renamed to `Jake.pt.YYYYMMDD` (or `Jake.wav.YYYYMMDD`), stamped with the date it was originally generated, and is ignored by voice discovery from then on. Touching a `.mp3` therefore cascades through both stages.
+
+   Conditioning reuses the already-loaded model, so it costs no extra VRAM — but it does add a few seconds of startup time per new voice. Each stage writes to a `.partial` file and renames on success, so an interrupted or failed run never leaves a truncated `.wav`/`.pt` behind, and a voice always keeps its last working file. Failures are logged and skipped; they never block startup.
+
+   > **Note:** `ffmpeg` must be on `PATH` for `.mp3` transcoding. The Docker image already includes it.
+
+   The startup pass bakes in the current `FATTERBOX_EXAGGERATION` value. To condition a voice out-of-band with a different value, use the included `scripts/condition_voice.py` script (dependencies are declared inline — `uv` handles the rest):
    ```bash
    # Generate conditioned voice (outputs voices/Jake.pt)
    uv run --no-project scripts/condition_voice.py voices/Jake.wav
@@ -60,6 +73,7 @@ FATTERBOX_WYOMING_PORT=10200
 FATTERBOX_OPENAPI_HOST=0.0.0.0
 FATTERBOX_OPENAPI_PORT=8000
 FATTERBOX_VOICES_DIR=./voices
+FATTERBOX_PRECONDITION_ON_START=false # transcode .mp3 and generate missing/outdated .pt at startup
 ```
 
 ### Model Configuration

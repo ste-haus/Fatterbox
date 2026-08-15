@@ -15,7 +15,7 @@ from wyoming.server import AsyncServer
 from .openapi import create_api
 from .handler import ChatterboxEventHandler
 from .model import load_model
-from .voices import load_voices, create_wyoming_info
+from .voices import precondition_voices, load_voices, create_wyoming_info
 from .utils import get_env_str, get_env_float, get_env_int, get_env_bool
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,6 +128,12 @@ async def main():
                        default=get_env_float("FATTERBOX_FLOW_CFG_SCALE", 1.0),
                        help="CFG scale for mel decoder (default: 1.0, env: FATTERBOX_FLOW_CFG_SCALE)")
     
+    parser.add_argument("--precondition-on-start",
+                       dest="precondition_on_start",
+                       action="store_true",
+                       default=get_env_bool("FATTERBOX_PRECONDITION_ON_START", False),
+                       help="At startup, transcode .mp3 sources to .wav and generate missing or outdated .pt files (default: false, env: FATTERBOX_PRECONDITION_ON_START)")
+
     parser.add_argument("--debug", 
                        action="store_true",
                        default=get_env_bool("FATTERBOX_DEBUG", False),
@@ -171,6 +177,12 @@ async def main():
     # Create voices directory if it doesn't exist
     args.voices_dir.mkdir(parents=True, exist_ok=True)
     
+    # Backfill derived voice files before discovery, so anything written here is picked up
+    if args.precondition_on_start:
+        precondition_voices(args.voices_dir, model, args.exaggeration)
+    else:
+        _LOGGER.info("Preconditioning disabled (set FATTERBOX_PRECONDITION_ON_START=true to enable)")
+
     # Load voices
     voices = load_voices(args.voices_dir)
     
