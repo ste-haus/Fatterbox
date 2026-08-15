@@ -55,7 +55,7 @@ docker run --gpus all \
   -v ./voices:/chatter/voices \
   -p 10200:10200 \
   -p 8000:8000 \
-  ghcr.io/ste-haus/fatterbox:latest
+  docker.io/justinlime/fatterbox:v0.1.0
 ```
 
 **3. Say something.**
@@ -74,7 +74,7 @@ That's it — `Jake.wav` became the voice `"Jake"`. Two servers are now listenin
 | Wyoming | `tcp://0.0.0.0:10200` | Home Assistant |
 | HTTP | `http://0.0.0.0:8000` | OpenAI-compatible clients, plus `/docs` |
 
-To build the image yourself instead: `docker build -t fatterbox .`
+To build the image yourself instead: `docker build -t fatterbox .`, then use `fatterbox` in place of the image above.
 
 ---
 
@@ -195,7 +195,7 @@ docker run --gpus all \
   -e FATTERBOX_EXAGGERATION=0.7 \
   -e FATTERBOX_CFG_WEIGHT=0.4 \
   -e FATTERBOX_PRECONDITION_ON_START=true \
-  ghcr.io/ste-haus/fatterbox:latest
+  docker.io/justinlime/fatterbox:v0.1.0
 ```
 
 ---
